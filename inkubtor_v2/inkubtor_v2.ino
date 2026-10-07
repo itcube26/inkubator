@@ -1,247 +1,155 @@
-// ====================================================================
-// ПОЛНЫЙ КОД УМНОГО ИНКУБАТОРА
-// Объединяет: GyverOLED, DHT11, Шаговый двигатель и Нагреватель
-// ====================================================================
-
-#include <GyverOLED.h>
 #include <DHT.h>
+#include <GyverOLED.h>
 
-// ====================================================================
-// 1. НАСТРОЙКИ ПИНОВ
-// ====================================================================
-const int PIN_DHT = 2;             // Датчик DHT11
-const int PIN_HEATER = 8;          // Нагреватель (реле или лампочка через транзистор)
-const int PIN_IN1 = 4;             // Шаговый двигатель (ULN2003)
-const int PIN_IN2 = 5;
-const int PIN_IN3 = 6;
-const int PIN_IN4 = 7;
+// --- Настройки пинов ---
+#define DHT_PIN 2
+#define RELAY_PIN 12
 
-// ====================================================================
-// 2. НАСТРОЙКИ ИНКУБАТОРА (МОЖНО МЕНЯТЬ)
-// ====================================================================
-#define DHT_TYPE DHT11             // Тип датчика (DHT11 или DHT22)
+// --- Настройки ПД-регулятора ---
+float setpoint = 37.5;   // Целевая температура (°C)
+float basePower = 20.0;  // Базовая мощность нагрева (%) для компенсации теплопотерь
+float Kp = 10.0;         // Пропорциональный коэффициент (сила реакции на ошибку)
+float Kd = 50.0;         // Дифференциальный коэффициент (гашение колебаний)
 
-const float TARGET_TEMP = 37.5;    // Целевая температура, °C
-const float HYSTERESIS = 0.3;      // Гистерезис нагрева (вкл при 37.2, выкл при 37.5)
+// Окно ШИМ-управления реле в мс. 
+// Для механического реле: 5000–10000 мс (чтобы не щелкало слишком часто).
+// Для SSR (твердотельного реле) или MOSFET: 100–500 мс.
+unsigned long windowSize = 5000; 
 
-// Настройки поворота яиц
-const uint16_t STEPS_PER_TURN = 500*18; // Сколько шагов делает мотор за один поворот (подберите экспериментально)
-const unsigned long STEP_DELAY = 2;  // Задержка между шагами в мс (2 мс = быстро и с хорошим усилием)
+// --- Инициализация компонентов ---
+// Используем OLED_BUFFER вместо OLED_NO_BUFFER для быстрой и плавной отрисовки графика!
+GyverOLED<SSD1306_128x64, OLED_BUFFER> oled;
+DHT dht(DHT_PIN, DHT11);
 
-// ВНИМАНИЕ: Для реального инкубатора поставьте 4 часа: 
-// const unsigned long TURN_INTERVAL = 4UL * 60UL * 60UL * 1000UL; 
-const unsigned long TURN_INTERVAL = 5000; // <-- ПОКА 5 СЕКУНД ДЛЯ ТЕСТА!
+// --- Переменные для графика ---
+const int GRAPH_WIDTH = 128;
+int16_t tempHistory[GRAPH_WIDTH]; // Храним температуру * 10 (экономия RAM)
 
-// ====================================================================
-// 3. МАССИВ ШАГОВ ДВИГАТЕЛЯ (Ваш 7-шаговый вариант)
-// ====================================================================
-const byte steps[7][4] = {
-  {LOW,  LOW,  HIGH, HIGH}, // Шаг 0
-  {LOW,  LOW,  HIGH, LOW }, // Шаг 1
-  {LOW,  HIGH, HIGH, LOW }, // Шаг 2
-  {HIGH, HIGH, LOW,  LOW }, // Шаг 3
-  {HIGH, LOW,  LOW,  LOW }, // Шаг 4
-  {HIGH, LOW,  LOW,  HIGH}, // Шаг 5
-  {LOW,  LOW,  LOW,  HIGH}  // Шаг 6
-};
+// --- Переменные для ПД-регулятора ---
+float last_error = 0;
+unsigned long last_time = 0;
+unsigned long windowStartTime = 0;
+float pdOutputMs = 0; // Время включения реле в текущем окне (мс)
 
-// ====================================================================
-// 4. ОБЪЕКТЫ И ПЕРЕМЕННЫЕ
-// ====================================================================
-GyverOLED<SSD1306_128x64, OLED_NO_BUFFER> oled;
-DHT dht(PIN_DHT, DHT_TYPE);
+// Функция перевода температуры (x10) в координату Y на экране
+// Диапазон температур графика: 30.0 ... 45.0 °C
+// Диапазон Y на экране: 63 (низ) ... 24 (верх)
+int getY(int16_t temp_x10) {
+  int t = constrain(temp_x10, 300, 450);
+  return 63 - ((t - 300) * 39) / 150; // Целочисленная математика для скорости и экономии памяти
+}
 
-float temperature = 0.0;
-float humidity = 0.0;
-bool sensorReady = false;
-
-// Переменные для мотора
-bool isTurning = false;
-uint16_t currentStep = 0;
-bool isClockwise = true;       // Текущее направление
-unsigned long lastStepTime = 0;
-unsigned long lastTurnTime = 0;
-
-// Переменные для таймеров (неблокирующая работа)
-unsigned long lastDhtTime = 0;
-unsigned long lastDisplayTime = 0;
-
-// ====================================================================
-// 5. SETUP (Инициализация)
-// ====================================================================
 void setup() {
   Serial.begin(9600);
   
-  // Настройка пинов
-  pinMode(PIN_HEATER, OUTPUT);
-  pinMode(PIN_IN1, OUTPUT);
-  pinMode(PIN_IN2, OUTPUT);
-  pinMode(PIN_IN3, OUTPUT);
-  pinMode(PIN_IN4, OUTPUT);
-  
-  stopMotor(); // Гарантированно выключаем мотор при старте
-  
+  // Инициализация датчика и реле
   dht.begin();
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);
   
-  // Приветствие на OLED
+  // Приветственное сообщение на дисплее
   oled.init();
   oled.clear();
-  oled.setScale(3);
-  oled.home();
-  oled.print("Привет!");
-  oled.update();
-  delay(1000);
-  
-  oled.clear();
+  oled.setScale(2);
+  oled.setCursorXY(0, 16);
+  oled.print("Incubator PD");
   oled.setScale(1);
-  oled.setCursor(0, 3);
-  oled.print("ЭТО умный инкубатор");
+  oled.setCursorXY(0, 40);
+  oled.print("Starting up...");
   oled.update();
   delay(1500);
   
-  lastTurnTime = millis();
-  Serial.println("Система запущена");
+  // Заполняем историю начальной температурой
+  float t_init = dht.readTemperature();
+  int16_t initialTemp = isnan(t_init) ? 250 : (int16_t)(t_init * 10);
+  for (int i = 0; i < GRAPH_WIDTH; i++) {
+    tempHistory[i] = initialTemp;
+  }
+  
+  last_time = millis();
+  windowStartTime = millis();
 }
 
-// ====================================================================
-// 6. LOOP (Главный цикл)
-// ====================================================================
 void loop() {
-  unsigned long currentTime = millis();
-
-  // 1. Опрос датчика каждые 2 секунды
-  if (currentTime - lastDhtTime >= 2000) {
-    readSensors();
-    lastDhtTime = currentTime;
-  }
-
-  // 2. Управление нагревателем (простой термостат)
-  controlHeater();
-
-  // 3. Логика поворота яиц (неблокирующая)
-  handleMotor(currentTime);
-
-  // 4. Обновление экрана каждые 500 мс
-  if (currentTime - lastDisplayTime >= 500) {
-    updateDisplay();
-    lastDisplayTime = currentTime;
-  }
-}
-
-// ====================================================================
-// 7. ФУНКЦИИ
-// ====================================================================
-
-// Чтение датчика DHT
-void readSensors() {
+  // 1. Считывание данных с датчика
   float h = dht.readHumidity();
   float t = dht.readTemperature();
-
-  if (!isnan(h) && !isnan(t)) {
-    humidity = h;
-    temperature = t;
-    sensorReady = true;
-  } else {
-    sensorReady = false;
-    Serial.println("Ошибка чтения DHT11");
-  }
-}
-
-// Управление нагревателем (гистерезис)
-void controlHeater() {
-  if (!sensorReady) return;
   
-  if (temperature < (TARGET_TEMP - HYSTERESIS)) {
-    digitalWrite(PIN_HEATER, HIGH); // Включить нагрев
-  } else if (temperature >= TARGET_TEMP) {
-    digitalWrite(PIN_HEATER, LOW);  // Выключить нагрев
-  }
-}
-
-// Логика шагового двигателя
-void handleMotor(unsigned long currentTime) {
-  // Если сейчас идет поворот
-  if (isTurning) {
-    if (currentTime - lastStepTime >= STEP_DELAY) {
-      // Выбираем индекс шага: прямой или обратный (математический реверс)
-      int stepIndex = currentStep % 7;
-      if (!isClockwise) {
-        stepIndex = (6 - stepIndex); // Реверс для 7-шагового массива
-      }
-
-      // Подаем напряжение на пины
-      digitalWrite(PIN_IN1, steps[stepIndex][0]);
-      digitalWrite(PIN_IN2, steps[stepIndex][1]);
-      digitalWrite(PIN_IN3, steps[stepIndex][2]);
-      digitalWrite(PIN_IN4, steps[stepIndex][3]);
-
-      currentStep++;
-      lastStepTime = currentTime;
-
-      // Проверка: закончили ли мы нужный поворот?
-      if (currentStep >= STEPS_PER_TURN) {
-        stopMotor();
-        isTurning = false;
-        isClockwise = !isClockwise; // Меняем направление на следующий раз!
-        lastTurnTime = currentTime; // Засекаем время для следующего интервала
-        Serial.println("Поворот завершен. Следующий раз будет в обратную сторону.");
-      }
+  if (isnan(h) || isnan(t)) {
+    // При ошибке датчика используем последнее известное значение, чтобы не ломать регулятор
+    t = tempHistory[GRAPH_WIDTH - 1] / 10.0;
+  } else {
+    // Сдвигаем массив истории и добавляем новое значение (умноженное на 10)
+    for (int i = 0; i < GRAPH_WIDTH - 1; i++) {
+      tempHistory[i] = tempHistory[i + 1];
     }
-  } 
-  // Если не крутимся, проверяем, не пора ли начать
-  else {
-    if (currentTime - lastTurnTime >= TURN_INTERVAL) {
-      Serial.println("Начинаем поворот яиц...");
-      isTurning = true;
-      currentStep = 0;
-      lastStepTime = currentTime;
-    }
+    tempHistory[GRAPH_WIDTH - 1] = (int16_t)(t * 10);
   }
-}
-
-// Остановка мотора (снятие напряжения с катушек для экономии и охлаждения драйвера)
-void stopMotor() {
-  digitalWrite(PIN_IN1, LOW);
-  digitalWrite(PIN_IN2, LOW);
-  digitalWrite(PIN_IN3, LOW);
-  digitalWrite(PIN_IN4, LOW);
-}
-
-// Отрисовка интерфейса на OLED
-void updateDisplay() {
-  oled.clear();
   
-  // Верхняя строка: Температура и Влажность
-  oled.setScale(2);
-  oled.setCursor(0, 0);
-  if (sensorReady) {
-    oled.print(temperature, 1);
-    oled.print("°C ");
-    oled.print(humidity, 0);
-    oled.print("%");
+  // 2. ПД-регулятор (обновляем раз в 1 секунду, т.к. тепловые процессы инерционны)
+  unsigned long now = millis();
+  if (now - last_time >= 1000) {
+    float dt = (now - last_time) / 1000.0;
+    float error = setpoint - t;
+    float derivative = (error - last_error) / dt;
+    
+    // Расчет выхода: база + пропорция + дифференциал
+    float outputPercent = basePower + (Kp * error) + (Kd * derivative);
+    outputPercent = constrain(outputPercent, 0.0, 100.0); // Ограничиваем от 0 до 100%
+    
+    // Переводим проценты в миллисекунды включения внутри временного окна
+    pdOutputMs = (outputPercent / 100.0) * windowSize;
+    
+    last_error = error;
+    last_time = now;
+    
+    // Вывод в Serial для отладки и подстройки коэффициентов
+    Serial.print("T: "); Serial.print(t, 1);
+    Serial.print(" | H: "); Serial.print(h, 1);
+    Serial.print(" | Err: "); Serial.print(error, 2);
+    Serial.print(" | Pwr: "); Serial.println(outputPercent, 1);
+  }
+  
+  // 3. Управление реле (широтно-импульсное управление по времени)
+  if (now - windowStartTime > windowSize) {
+    windowStartTime += windowSize; // Сдвигаем окно без дрейфа времени
+  }
+  
+  if (now - windowStartTime < pdOutputMs) {
+    digitalWrite(RELAY_PIN, HIGH); // Включаем нагрев
   } else {
-    oled.print("--.-°C --%");
+    digitalWrite(RELAY_PIN, LOW);  // Выключаем нагрев
   }
   
-  // Средняя часть: Статус нагрева
-  oled.setScale(1);
-  oled.setCursor(0, 3);
-  if (digitalRead(PIN_HEATER) == HIGH) {
-    oled.print("[HEATER: ON ]");
-  } else {
-    oled.print("[HEATER: OFF]");
+  // 4. Отрисовка интерфейса на OLED дисплее
+  oled.clear(); // Очищаем буфер перед новым кадром
+  
+  // Текстовая часть (верхние 24 пикселя)
+  oled.setCursorXY(0, 0);
+  oled.print("T:"); oled.print(t, 1); oled.print("C  H:"); oled.print(h, 0); oled.print("%");
+  
+  oled.setCursorXY(0, 8);
+  float currentPowerPercent = (pdOutputMs / windowSize) * 100.0;
+  oled.print("Trg:"); oled.print(setpoint, 1); oled.print("C  Pwr:"); oled.print(currentPowerPercent, 0); oled.print("%");
+  
+  // Графическая часть (Y от 24 до 63)
+  oled.line(0, 24, 127, 24);       // Верхняя граница графика (45°C)
+  oled.line(0, 63, 127, 63);       // Нижняя граница графика (30°C)
+  
+  // Линия целевой температуры (пунктиром или сплошной, здесь сплошная для простоты)
+  int targetY = getY((int16_t)(setpoint * 10));
+  oled.line(0, targetY, 127, targetY);
+  
+  // Отрисовка самого графика температуры
+  for (int i = 0; i < GRAPH_WIDTH - 1; i++) {
+    int y1 = getY(tempHistory[i]);
+    int y2 = getY(tempHistory[i + 1]);
+    oled.line(i, y1, i + 1, y2);
   }
   
-  // Нижняя часть: Статус поворота
-  oled.setCursor(0, 6);
-  if (isTurning) {
-    oled.print(isClockwise ? ">>> ПОВОРОТ ВПРАВО" : "<<< ПОВОРОТ ВЛЕВО");
-  } else {
-    unsigned long minsLeft = (TURN_INTERVAL - (millis() - lastTurnTime)) / 60000;
-    oled.print("След. поворот: ");
-    oled.print(minsLeft);
-    oled.print(" мин");
-  }
-  
+  // Отправляем содержимое буфера на физический дисплей
   oled.update();
+  
+  // Небольшая задержка для стабильности работы датчика DHT
+  delay(100);
 }

@@ -16,4 +16,10 @@ void loop() {
   Serial.println(h);
   Serial.print("Temperature: ");
   Serial.println(t);
+
+  pinMode(12, OUTPUT); // объявляем пин 12 как выход
+  digitalWrite(12, HIGH); // замыкаем реле
+  delay(3000); // ждем 3 секунды
+  digitalWrite(12, LOW); // размыкаем реле
+  delay(1000); // ждем 1 секунду
 }
